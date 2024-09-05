@@ -1,0 +1,76 @@
+#!/bin/bash
+
+# 设置初始变量
+KEYSFILE="private_keys.txt" # 存放私钥的文件
+IMAGE_NAME="hemi"           # Docker镜像名称
+FEE=180                     # 初始手续费
+CHA=50                      # 手续费差异触发阈值
+COUNTER=1                   # 容器计数器
+MONITOR_INTERVAL=300        # 监控间隔时间（秒）
+TEMP_FILE="/tmp/response.json"
+PROXY="http://你的代理"      # 代理地址（可选）
+
+# 函数：获取最新手续费
+get_latest_fee() {
+    echo "抓取最新手续费数据..."
+    curl -s https://mempool.space/testnet/api/v1/fees/recommended -o "$TEMP_FILE"
+    NEW_FEE=$(jq '.fastestFee' "$TEMP_FILE")
+}
+
+# 函数：删除所有运行中的容器
+remove_all_containers() {
+    echo "删除所有现有容器..."
+    docker ps -q | xargs -r docker rm -f
+}
+
+# 函数：运行多个容器实例
+run_containers() {
+    echo "启动新容器..."
+    while IFS= read -r PRIVATE_KEY; do
+        CONTAINER_NAME="hemi$COUNTER"
+        # 启动容器并设置相关的环境变量
+        docker run -d --name "$CONTAINER_NAME" \
+            -e POPM_BTC_PRIVKEY="$PRIVATE_KEY" \
+            -e POPM_STATIC_FEE="$FEE" \
+            -e HTTP_PROXY="$PROXY" \
+            -e HTTPS_PROXY="$PROXY" \
+            -e ALL_PROXY="$PROXY" \
+            "$IMAGE_NAME"
+        echo "启动容器 $CONTAINER_NAME 使用私钥 $PRIVATE_KEY"
+        ((COUNTER++))
+    done < "$KEYSFILE"
+}
+
+# 函数：监控和调整手续费
+monitor_loop() {
+    while true; do
+        get_latest_fee
+        echo "最新手续费: $NEW_FEE"
+        echo "当前手续费: $FEE"
+
+        # 计算手续费差异
+        FEE_DIFFERENCE=$((FEE - NEW_FEE))
+
+        # 判断是否需要更新手续费
+        if [[ $NEW_FEE -gt $FEE ]]; then
+            echo "最新手续费 ($NEW_FEE) 高于当前设置手续费 ($FEE)，重新启动容器..."
+            remove_all_containers
+            FEE=$((NEW_FEE + 20))
+            COUNTER=1
+            run_containers
+        elif [[ $FEE_DIFFERENCE -ge $CHA ]]; then
+            echo "最新手续费 ($NEW_FEE) 比当前手续费小 $CHA 或更多，更新手续费..."
+            remove_all_containers
+            FEE=$((NEW_FEE + 20))
+            COUNTER=1
+            run_containers
+        fi
+
+        echo "等待 $MONITOR_INTERVAL 秒后进行下一次检查..."
+        sleep "$MONITOR_INTERVAL"
+    done
+}
+
+# 主执行逻辑
+run_containers
+monitor_loop
